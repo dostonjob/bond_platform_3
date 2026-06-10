@@ -247,7 +247,7 @@ def _write_report(wb, params, rows):
 
         label = row.get('label') or (fmt_date(row['date']) if row.get('date') else '—')
         vals = [
-            label, row['cashflow'], row['nominal'],
+            label, row.get('cashflow', 0.0), row.get('nominal', row.get('nominal_value', row.get('principal', 0.0))),
             row['num_days'] if row.get('num_days') else None,
             row['bond_discount'], row['cum_amort_disc'],
             row['bond_premium'],  row['cum_amort_prem'],
