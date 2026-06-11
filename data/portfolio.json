@@ -4,7 +4,7 @@
     "isin": "",
     "issuer": "",
     "created_at": "2026-06-10T09:58:37.495161",
-    "updated_at": "2026-06-10T09:58:37.495161",
+    "updated_at": "2026-06-10T11:00:46.443795",
     "params": {
       "isin": "",
       "issuer": "",
@@ -20,7 +20,100 @@
       "premium": 0.0,
       "coupon_dates": []
     },
-    "transactions": [],
+    "transactions": [
+      {
+        "date": "2024-07-15",
+        "type": "BUY",
+        "nominal": 1000000.0,
+        "clean_price": 95.0,
+        "accrued_interest": 0.0,
+        "note": "heloo"
+      },
+      {
+        "date": "2024-07-15",
+        "type": "BUY",
+        "nominal": 1000000.0,
+        "clean_price": 95.0,
+        "accrued_interest": 0.0,
+        "note": ""
+      },
+      {
+        "date": "2024-07-15",
+        "type": "SELL_FULL",
+        "nominal": 1700000.0,
+        "clean_price": 95.0,
+        "accrued_interest": 0.0,
+        "note": ""
+      }
+    ],
+    "notes": ""
+  },
+  {
+    "id": "1ec1d85a",
+    "isin": "",
+    "issuer": "",
+    "created_at": "2026-06-10T11:12:12.061361",
+    "updated_at": "2026-06-10T11:14:40.677137",
+    "params": {
+      "isin": "",
+      "issuer": "",
+      "par_value": 137000000.0,
+      "clean_price": 99.86328125,
+      "coupon_rate": 4.0,
+      "interest_frequency": 2,
+      "settle_date": "2026-05-14",
+      "last_interest_date": "2026-01-31",
+      "next_interest_date": "2026-07-31",
+      "maturity_date": "2029-07-31",
+      "discount": -187304.68749999694,
+      "premium": 0.0,
+      "coupon_dates": []
+    },
+    "transactions": [
+      {
+        "date": "2026-05-27",
+        "type": "BUY",
+        "nominal": 5900000.0,
+        "clean_price": 99.640625,
+        "accrued_interest": 75624.31,
+        "note": ""
+      }
+    ],
+    "notes": ""
+  },
+  {
+    "id": "e406c9f3",
+    "isin": "AAA1112314",
+    "issuer": "AA1224",
+    "created_at": "2026-06-11T10:26:06.524809",
+    "updated_at": "2026-06-11T10:30:04.648821",
+    "params": {
+      "isin": "AAA1112314",
+      "issuer": "AA1224",
+      "par_value": 137000000.0,
+      "clean_price": 99.86328125,
+      "coupon_rate": 4.0,
+      "interest_frequency": 2,
+      "settle_date": "2026-05-14",
+      "last_interest_date": "2026-01-31",
+      "next_interest_date": "2026-07-31",
+      "maturity_date": "2029-07-31",
+      "discount": -187304.68749999694,
+      "premium": 0.0,
+      "coupon_dates": [],
+      "default_probability": 0.0,
+      "lgd": 60.0
+    },
+    "transactions": [
+      {
+        "date": "2026-05-27",
+        "type": "BUY",
+        "nominal": 5900000.0,
+        "clean_price": 99.640625,
+        "accrued_interest": 75624.31,
+        "note": ""
+      }
+    ],
     "notes": ""
   }
 ]
