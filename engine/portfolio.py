@@ -52,22 +52,56 @@ def _date_hook(dct):
 
 
 # ─── LOAD / SAVE ──────────────────────────────────────────────────────────────
+# The parsed file is cached in-process and invalidated by file mtime+size, so
+# repeated reads (sidebar stats, page reruns) don't re-parse a large JSON.
+
+_CACHE: Dict[str, Any] = {'stamp': None, 'records': None}
+
+
+def _file_stamp():
+    try:
+        st = os.stat(STORE_PATH)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
 
 def _load() -> List[Dict]:
     os.makedirs(os.path.dirname(STORE_PATH), exist_ok=True)
-    if not os.path.exists(STORE_PATH):
+    stamp = _file_stamp()
+    if stamp is None:
         return []
+    if _CACHE['stamp'] == stamp and _CACHE['records'] is not None:
+        return _CACHE['records']
     try:
         with open(STORE_PATH, 'r') as f:
-            return json.load(f, object_hook=_date_hook)
+            records = json.load(f, object_hook=_date_hook)
     except (json.JSONDecodeError, OSError):
         return []
+    _CACHE['stamp']   = stamp
+    _CACHE['records'] = records
+    return records
 
 
 def _save(records: List[Dict]):
     os.makedirs(os.path.dirname(STORE_PATH), exist_ok=True)
-    with open(STORE_PATH, 'w') as f:
-        json.dump(records, f, cls=_DateEncoder, indent=2)
+    tmp = STORE_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(records, f, cls=_DateEncoder, separators=(',', ':'))
+    os.replace(tmp, STORE_PATH)          # atomic — no torn file on crash
+    _CACHE['stamp']   = _file_stamp()
+    _CACHE['records'] = records
+    for k in ('sorted_for', 'index_for', 'stats_for'):   # derived views rebuild
+        _CACHE.pop(k, None)
+
+
+def _by_id() -> Dict[str, Dict]:
+    """Lazy id→record index, rebuilt only when the record list changes."""
+    records = _load()
+    if _CACHE.get('index_for') is not records:
+        _CACHE['by_id']    = {r['id']: r for r in records}
+        _CACHE['index_for'] = records
+    return _CACHE['by_id']
 
 
 # ─── PUBLIC API ───────────────────────────────────────────────────────────────
@@ -103,16 +137,16 @@ def save_bond(params: Dict, transactions: List[Dict], notes: str = '') -> str:
 
 
 def get_all() -> List[Dict]:
-    """Return all bond records, newest first."""
+    """Return all bond records, newest first (sorted view is cached)."""
     records = _load()
-    return sorted(records, key=lambda r: r.get('created_at', ''), reverse=True)
+    if _CACHE.get('sorted_for') is not records:
+        _CACHE['sorted'] = sorted(records, key=lambda r: r.get('created_at', ''), reverse=True)
+        _CACHE['sorted_for'] = records
+    return _CACHE['sorted']
 
 
 def get_by_id(record_id: str) -> Optional[Dict]:
-    for r in _load():
-        if r['id'] == record_id:
-            return r
-    return None
+    return _by_id().get(record_id)
 
 
 def search_by_isin(isin: str) -> List[Dict]:
@@ -145,13 +179,13 @@ def update_bond(record_id: str, params: Optional[Dict] = None,
 def add_transaction(record_id: str, tx: Dict) -> bool:
     """Append a single transaction to an existing bond record."""
     records = _load()
-    for i, r in enumerate(records):
-        if r['id'] == record_id:
-            records[i]['transactions'].append(deepcopy(tx))
-            records[i]['updated_at'] = datetime.now().isoformat()
-            _save(records)
-            return True
-    return False
+    rec = _by_id().get(record_id)
+    if rec is None:
+        return False
+    rec.setdefault('transactions', []).append(deepcopy(tx))
+    rec['updated_at'] = datetime.now().isoformat()
+    _save(records)
+    return True
 
 
 def delete_bond(record_id: str) -> bool:
@@ -172,9 +206,12 @@ def get_full_params(record: Dict) -> Dict:
 
 def get_portfolio_stats() -> Dict:
     records = _load()
-    isins   = list({r['isin'] for r in records if r.get('isin')})
-    return {
-        'total_bonds':   len(records),
-        'unique_isins':  len(isins),
-        'isins':         isins,
-    }
+    if _CACHE.get('stats_for') is not records:
+        isins = list({r['isin'] for r in records if r.get('isin')})
+        _CACHE['stats'] = {
+            'total_bonds':  len(records),
+            'unique_isins': len(isins),
+            'isins':        isins,
+        }
+        _CACHE['stats_for'] = records
+    return _CACHE['stats']

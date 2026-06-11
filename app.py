@@ -17,7 +17,14 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
-#MainMenu,footer,header{visibility:hidden;}
+#MainMenu,footer{visibility:hidden;}
+/* Header stays (it holds the reopen-sidebar arrow) — just made invisible-looking */
+header[data-testid="stHeader"]{background:transparent !important;}
+[data-testid="stToolbar"],[data-testid="stDecoration"],[data-testid="stStatusWidget"]{visibility:hidden;}
+/* Sidebar open/close arrows must always be clickable */
+[data-testid="stExpandSidebarButton"],
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"]{visibility:visible !important;}
 
 /* ── Banner ── */
 .banner{background:linear-gradient(135deg,#1F4E79 0%,#2E75B6 100%);color:white;
@@ -90,7 +97,8 @@ from engine.excel_io import read_from_excel, export_to_excel
 
 # ── Session state ──────────────────────────────────────────────────────────────
 for k, v in [('page','home'),('params',None),('rows',None),('summary',None),
-              ('edit_id',None),('calc_txs',[]),('warnings',[])]:
+              ('edit_id',None),('calc_txs',[]),('warnings',[]),
+              ('xls_for',None),('xls_data',None)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -446,7 +454,7 @@ elif page == 'portfolio':
     with c2: st.button("🔍 Search", use_container_width=True)
 
     records = search_by_isin(isin_q) if isin_q else get_all()
-    sec(f"{'Search Results' if isin_q else 'All Bonds'}  ({len(records)})")
+    sec(f"{'Search Results' if isin_q else 'All Bonds'}  ({len(records):,})")
 
     if not records:
         if isin_q:
@@ -454,7 +462,19 @@ elif page == 'portfolio':
         else:
             st.info("No bonds saved yet. Use Upload or New Bond to get started.")
     else:
-        for rec in records:
+        # Pagination — only the current page is rendered
+        c1,c2,c3 = st.columns([2,2,8])
+        with c1:
+            page_size = st.selectbox("Per page", [25, 50, 100], index=0)
+        n_pages = max(1, -(-len(records) // page_size))
+        with c2:
+            page_no = st.number_input("Page", min_value=1, max_value=n_pages, value=1)
+        start = (page_no - 1) * page_size
+        page_records = records[start:start + page_size]
+        st.caption(f"Page {page_no:,} of {n_pages:,}  ·  "
+                   f"bonds {start+1:,}–{start+len(page_records):,} of {len(records):,}")
+
+        for rec in page_records:
             p    = rec['params']
             disc, prem = calc_discount_premium(p.get('par_value',0), p.get('clean_price',100))
             bt   = 'Discount' if disc<0 else ('Premium' if prem>0 else 'Par')
@@ -498,14 +518,18 @@ elif page == 'portfolio':
                         st.session_state.edit_id = rec['id']
                         go("edit_bond")
                 with c3:
-                    # Inline export
-                    fp   = get_full_params(rec)
-                    rows2 = build_cashflow_table(fp)
-                    xls2  = export_to_excel(fp, rows2)
-                    st.download_button("📥 Excel", data=xls2,
-                        file_name=f"bond_{rec.get('isin','x')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"dl_{rec['id']}", use_container_width=True)
+                    # Lazy export — workbook is built only when requested
+                    if st.session_state.get('xls_for') == rec['id']:
+                        st.download_button("⬇ Download .xlsx",
+                            data=st.session_state.get('xls_data', b''),
+                            file_name=f"bond_{rec.get('isin','x')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"dl_{rec['id']}", use_container_width=True, type="primary")
+                    elif st.button("📥 Excel", key=f"x_{rec['id']}", use_container_width=True):
+                        fp = get_full_params(rec)
+                        st.session_state.xls_data = export_to_excel(fp, build_cashflow_table(fp))
+                        st.session_state.xls_for  = rec['id']
+                        st.rerun()
                 with c4:
                     if st.button("🗑 Delete", key=f"d_{rec['id']}", use_container_width=True):
                         delete_bond(rec['id'])
