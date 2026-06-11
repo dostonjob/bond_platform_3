@@ -203,45 +203,46 @@ def _lot_carrying_value(lot: Dict, on_date: date, maturity: date) -> float:
     return lot['nominal'] + lot['disc'] * rem + lot['prem'] * rem
 
 
-def _fifo_unwind(lots: List[Dict], sell_nom: float) -> List[Dict]:
-    """Remove sell_nom from lots FIFO. Returns the remaining lots."""
-    remaining = []
-    to_sell   = sell_nom
-    for lot in lots:
-        if to_sell <= 0:
-            remaining.append(lot)
-        elif lot['nominal'] <= to_sell + 0.01:   # absorb rounding
-            to_sell -= lot['nominal']
-        else:
-            frac = (lot['nominal'] - to_sell) / lot['nominal']
-            remaining.append({**lot,
-                'nominal': lot['nominal'] - to_sell,
-                'disc':    lot['disc'] * frac,
-                'prem':    lot['prem'] * frac,
-            })
-            to_sell = 0
-    return remaining
+def _proportional_unwind(lots: List[Dict], sell_nom: float) -> List[Dict]:
+    """
+    Scale every lot proportionally by (remaining / pre_sell) — the method
+    used in the reference Excel.  Nominal, disc and prem all scale together,
+    so the WAC of the remaining position is preserved and the amortisation
+    schedule produced by _agg() matches the Excel exactly.
+    """
+    total = sum(l['nominal'] for l in lots)
+    if total <= 0:
+        return []
+    scale = (total - sell_nom) / total
+    if scale <= 0:
+        return []
+    return [
+        {**lot,
+         'nominal': lot['nominal'] * scale,
+         'disc':    lot['disc']    * scale,
+         'prem':    lot['prem']    * scale}
+        for lot in lots
+    ]
 
 
-def _realized_pl(lots: List[Dict], sell_nom: float,
-                 sell_price: float, sell_date: date, maturity: date) -> float:
-    """Realized P&L = sale proceeds − carrying value of FIFO lots sold."""
+def _proportional_pl(lots: List[Dict], sell_nom: float,
+                     sell_price: float, sell_date: date,
+                     maturity: date) -> tuple:
+    """
+    Proportional-method realized P&L and CV of sold portion.
+    Returns (realized_pl, cv_sold_positive).
+
+    Excel formula:  I_sell = I_next × (sell_nom / total_nom)  [approx]
+                    P&L    = proceeds − cv_sold
+    """
+    total = sum(l['nominal'] for l in lots)
+    if total <= 0:
+        return 0.0, 0.0
+    sell_frac = sell_nom / total
+    cv_total  = sum(_lot_carrying_value(l, sell_date, maturity) for l in lots)
+    cv_sold   = cv_total * sell_frac
     proceeds  = sell_nom * sell_price / 100.0
-    cv_sold   = 0.0
-    remaining = sell_nom
-    for lot in lots:
-        if remaining <= 0:
-            break
-        matched     = min(lot['nominal'], remaining)
-        frac_of_lot = matched / lot['nominal']
-        cv_sold    += _lot_carrying_value(
-            {**lot, 'nominal': matched,
-             'disc': lot['disc'] * frac_of_lot,
-             'prem': lot['prem'] * frac_of_lot},
-            sell_date, maturity
-        )
-        remaining  -= matched
-    return round(proceeds - cv_sold, 2)
+    return round(proceeds - cv_sold, 2), round(cv_sold, 4)
 
 
 # ─── VALIDATION ───────────────────────────────────────────────────────────────
@@ -437,6 +438,7 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
             'price': None,
             'mtm': None, 'oci_gl': None, 'nav': None,
             'check': None,
+            'cv_sold': None,
             'realized_pl': None,
             'realized_interest_income': None,
             'total_pl': None,
@@ -574,16 +576,24 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
 
                     if not tx_acc:
                         tx_acc = _accrued_at(sell_nom, d)
-                    pl = _realized_pl(lots, sell_nom, tx_price, d, maturity_date)
+
+                    # Snapshot BEFORE sell — needed for WAC and proportional CV
+                    _, _, _, _, _, _, wac_before = _agg(lots, d)
+
+                    # Proportional P&L: P&L = proceeds − proportional CV of sold portion
+                    pl, cv_sold = _proportional_pl(lots, sell_nom, tx_price, d, maturity_date)
                     proceeds = sell_nom * tx_price / 100.0 + tx_acc
-                    lots = _fifo_unwind(lots, sell_nom)
+
+                    # Scale all lots proportionally (the Excel method)
+                    lots = _proportional_unwind(lots, sell_nom)
                     cum_sell_pl  += pl
                     cum_interest += tx_acc
 
-                    # Full position snapshot AFTER the sell (remaining lots)
+                    # Post-sell remaining position
                     tn, td, tp_, ca, cp_, cv, wac = _agg(lots, d)
-                    mtm = (tn * wac / 100.0 - cv) if wac is not None else 0.0
-                    nav = cv + mtm
+
+                    # MTM on sell row = unrealised difference between sell price and cost
+                    mtm_sell = round(sell_nom * (tx_price - (wac_before or tx_price)) / 100.0, 2)
 
                     r = _blank_row()
                     r.update({
@@ -596,21 +606,26 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
                         'cum_amort_disc':  round(ca, 4),
                         'bond_premium':    round(tp_, 4),
                         'cum_amort_prem':  round(cp_, 4),
+                        # cv_sold stored separately for Excel; carrying_value = remaining
+                        'cv_sold':         round(cv_sold, 4),
                         'carrying_value':  round(cv, 4),
                         'accrued_int':     tx_acc,
                         'nominal_balance': tn,
                         'price':           tx_price,
-                        'mtm':             round(mtm, 2),
-                        'oci_gl':          round(mtm, 2),
-                        'nav':             round(nav, 2),
+                        'mtm':             mtm_sell,
+                        'oci_gl':          mtm_sell,
+                        'nav':             round(cv + mtm_sell, 2),
                         'check':           round(cv - (tn + td + tp_), 2),
-                        'check2':          round(nav - (cv + mtm), 2),
+                        'check2':          0.0,
                         'realized_pl':     pl,
                         'realized_interest_income': round(cum_interest, 2),
                         'total_pl':        round(cum_sell_pl + cum_interest, 2),
-                        'wac':             round(wac, 8) if wac is not None else None,
+                        'wac':             round(wac_before, 8) if wac_before is not None else None,
                         'is_sell':         True,
-                        'tx_detail':       f'Sell {sell_nom:,.0f} face @ {tx_price:.6f}%  |  proceeds: {proceeds:,.2f}  |  realized P&L: {pl:+,.2f}'
+                        'tx_detail':       f'Sell {sell_nom:,.0f} face @ {tx_price:.6f}%'
+                                           f'  |  proceeds: {proceeds:,.2f}'
+                                           f'  |  CV removed: {cv_sold:,.2f}'
+                                           f'  |  realized P&L: {pl:+,.2f}'
                                            + (f'  |  {tx_note}' if tx_note else ''),
                     })
                     _credit(r, tn * wac / 100.0 if wac is not None else 0.0)
@@ -650,10 +665,12 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
             accrued_row   = cpp
             cum_interest += cpp
 
-        # WAC price for MTM proxy (fair value at cost vs amortized carrying value)
-        mtm    = total_nominal * wac / 100.0 - carrying_val
-        oci_gl = mtm
-        nav    = carrying_val + mtm
+        # No market price available on period rows → MTM = 0.
+        # OCI = 0 (no unrealised price movement without a market quote).
+        # NAV = carrying value (amortised cost).
+        mtm    = 0.0
+        oci_gl = 0.0
+        nav    = carrying_val
 
         r = _blank_row()
         r.update({
@@ -672,7 +689,7 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
             'oci_gl':          round(oci_gl, 2),
             'nav':             round(nav, 2),
             'check':           round(carrying_val - (total_nominal + total_disc + total_prem), 2),
-            'check2':          round(nav - (carrying_val + mtm), 2),
+            'check2':          0.0,
             'realized_interest_income': round(cum_interest, 2),
             'total_pl':        round(cum_sell_pl + cum_interest, 2),
             'wac':             round(wac, 8),

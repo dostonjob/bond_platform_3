@@ -364,12 +364,18 @@ def _write_report(wb, params, rows):
         else:                        bg = 'FFFFFF'
 
         label = row.get('label') or (fmt_date(row['date']) if row.get('date') else '—')
+        # On sell rows use -cv_sold for the Carrying Value column (matches reference I53)
+        cv_display = (
+            -row['cv_sold']
+            if row.get('is_sell') and row.get('cv_sold') is not None
+            else row.get('carrying_value')
+        )
         vals = [
             label, row.get('cashflow'), row.get('nominal_change'),
             row.get('num_days'),
             row.get('bond_discount'), row.get('cum_amort_disc'),
             row.get('bond_premium'),  row.get('cum_amort_prem'),
-            row.get('carrying_value'), row.get('accrued_int'),
+            cv_display, row.get('accrued_int'),
             row.get('nominal_balance'), row.get('price'),
             row.get('mtm'), row.get('oci_gl'), row.get('nav'),
             row.get('check'),
@@ -397,12 +403,45 @@ def _write_report(wb, params, rows):
             if ci in (17,19) and isinstance(val,(int,float)) and val != 0:
                 c.font = Font(name='Arial', size=9, bold=True,
                               color='375623' if val >= 0 else 'C00000')
-            if row.get('is_sell') and ci in (2,14,15):
+            # Sell row: red for carrying value (-cv_sold), cashflow, NAV
+            if row.get('is_sell') and ci in (2, 9, 14, 15):
                 c.font = Font(name='Arial', size=9, color='C00000', bold=True)
             if row.get('is_buy') and ci == 2:
                 c.font = Font(name='Arial', size=9, color='375623', bold=True)
 
     ws.freeze_panes = ws.cell(row=5, column=2)
+
+    # ── Nominal Tracker mini-table (right of main headers, like H2:I7 in reference) ──
+    tc = ncols + 2   # first tracker column (gap of 1)
+    tracker_events = [
+        (r.get('label') or fmt_date(r.get('date')) or '—',
+         r.get('nominal_balance'),
+         r.get('wac'))
+        for r in rows if r.get('is_buy') or r.get('is_sell')
+    ]
+    if tracker_events:
+        # Header
+        for ci, h in enumerate(['Transaction', 'Nominal Balance', 'Running WAC'], tc):
+            c = ws.cell(row=hr, column=ci, value=h)
+            c.font      = Font(name='Arial', bold=True, size=9, color='FFFFFF')
+            c.fill      = _fill(NAVY)
+            c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            c.border    = _border()
+        ws.column_dimensions[get_column_letter(tc)].width   = 38
+        ws.column_dimensions[get_column_letter(tc+1)].width = 18
+        ws.column_dimensions[get_column_letter(tc+2)].width = 14
+        # Data rows
+        for ri, (lbl, nom, wac_v) in enumerate(tracker_events, start=hr + 1):
+            bg_t = BUY_BG if 'Buy' in (lbl or '') else RED_BG
+            c0 = ws.cell(row=ri, column=tc, value=lbl)
+            c0.font = Font(name='Arial', size=9); c0.fill = _fill(bg_t); c0.border = _border()
+            c0.alignment = Alignment(horizontal='left')
+            c1 = ws.cell(row=ri, column=tc+1, value=nom)
+            c1.font = Font(name='Arial', size=9); c1.fill = _fill(bg_t); c1.border = _border()
+            c1.alignment = Alignment(horizontal='right'); c1.number_format = FIN
+            c2 = ws.cell(row=ri, column=tc+2, value=wac_v)
+            c2.font = Font(name='Arial', size=9); c2.fill = _fill(bg_t); c2.border = _border()
+            c2.alignment = Alignment(horizontal='right'); c2.number_format = PCT8
 
 
 def _write_summary(wb, params, rows):
