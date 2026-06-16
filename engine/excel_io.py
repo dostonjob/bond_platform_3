@@ -364,12 +364,9 @@ def _write_report(wb, params, rows):
         else:                        bg = 'FFFFFF'
 
         label = row.get('label') or (fmt_date(row['date']) if row.get('date') else '—')
-        # On sell rows use -cv_sold for the Carrying Value column (matches reference I53)
-        cv_display = (
-            -row['cv_sold']
-            if row.get('is_sell') and row.get('cv_sold') is not None
-            else row.get('carrying_value')
-        )
+        # Transactions are recognised on their date, so the carrying value column
+        # always shows the position AFTER the trade (remaining holding).
+        cv_display = row.get('carrying_value')
         vals = [
             label, row.get('cashflow'), row.get('nominal_change'),
             row.get('num_days'),

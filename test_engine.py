@@ -84,13 +84,10 @@ sell = [r for r in rows_m if r.get('is_sell')][0]
 exp_sell_acc = 600_000*0.08/2 * 59/181  # 15-Jan-25→15-Mar-25 = 59d of 181d period
 check("SELL auto-accrued derived", abs(sell['accrued_int'] - exp_sell_acc) < 0.5,
       f"(got {sell['accrued_int']:,.2f}, expect {exp_sell_acc:,.2f})")
-# Transaction rows are now helper rows: the sold portion shows as a negative
-# delta; the reduced position appears on the next dated period row.
-check("sell helper shows sold portion = -600,000", sell['nominal_balance'] == -600_000)
-post_sell = next(r for r in rows_m if r.get('date') and r['date'] > date(2025,3,15)
-                 and not r.get('is_buy') and not r.get('is_sell'))
-check("balance after partial sell = 900,000", post_sell['nominal_balance'] == 900_000,
-      f"(got {post_sell['nominal_balance']:,.0f})")
+# Transactions are recognised on their own date: the sell row shows the reduced
+# position (1.5m − 600k = 900k) directly, with proceeds and realized P&L.
+check("balance after partial sell = 900,000", sell['nominal_balance'] == 900_000,
+      f"(got {sell['nominal_balance']:,.0f})")
 check("realized P&L present", sell['realized_pl'] is not None and s_m['total_realized_pl'] == sell['realized_pl'])
 # coupons after the buy reflect 1.5m nominal
 cpn_after_buy = [r for r in rows_m if r.get('is_coupon') and not r.get('is_maturity')
@@ -179,31 +176,31 @@ re2, _ = read_from_excel(io.BytesIO(xls2))
 check("SELL_FULL survives round-trip", re2['transactions'][0]['type'] == 'SELL_FULL',
       f"(got {re2['transactions'][0]['type']})")
 
-# ── 11. Multi-buy convention: a transaction is a helper row showing only the
-#        new lot / sold portion; the COMBINED position appears on the next
-#        dated period row (effect-from-next-row, matching the reference). ──────
+# ── 11. Multi-buy: the buy row (recognised on its date) shows the FULL combined
+#        position, and every later row carries it forward. ────────────────────
 # lot1: 1,000,000 @95 from 15-Jan-24 (disc -50,000, 1827 days to maturity)
-# buy2: 500,000 @96 on 15-Sep-24 (disc -20,000, 1583 days to maturity)
-check("buy helper shows new lot nominal = 500,000", buy2['nominal_balance'] == 500_000,
+# buy2: 500,000 @96 on 15-Sep-24 (244 days elapsed on lot1, disc -20,000)
+lot1_cv_at_buy2 = 1_000_000 - 50_000 * (1 - 244 / 1827)
+exp_cv = lot1_cv_at_buy2 + 500_000 * 0.96
+check("buy row shows combined carrying value",
+      abs(buy2['carrying_value'] - exp_cv) < 0.01,
+      f"(got {buy2['carrying_value']:,.2f}, expect {exp_cv:,.2f})")
+exp_disc = -50_000 * (1583 / 1827) + (-20_000)   # lot1 remaining + lot2 full
+check("buy row shows combined remaining discount",
+      abs(buy2['bond_discount'] - exp_disc) < 0.01,
+      f"(got {buy2['bond_discount']:,.2f}, expect {exp_disc:,.2f})")
+check("buy row shows combined nominal = 1,500,000", buy2['nominal_balance'] == 1_500_000,
       f"(got {buy2['nominal_balance']:,.0f})")
-check("buy helper carrying = new lot cost (480,000)",
-      abs(buy2['carrying_value'] - 480_000) < 0.01, f"(got {buy2['carrying_value']:,.2f})")
-check("buy helper discount = new lot disc (-20,000)",
-      abs(buy2['bond_discount'] - (-20_000)) < 0.01, f"(got {buy2['bond_discount']:,.2f})")
-post_buy = next(r for r in rows_m if r.get('date') and r['date'] > date(2024, 9, 15)
-                and not r.get('is_buy') and not r.get('is_sell'))
-check("combined nominal on next row = 1,500,000", post_buy['nominal_balance'] == 1_500_000,
-      f"(got {post_buy['nominal_balance']:,.0f})")
-d_pb  = post_buy['date']
-days1 = (d_pb - date(2024, 1, 15)).days     # lot1 elapsed
-days2 = (d_pb - date(2024, 9, 15)).days     # lot2 elapsed
-exp_cv = (1_000_000 - 50_000 * (1 - days1 / 1827)) + (500_000 - 20_000 * (1 - days2 / 1583))
-check("combined carrying value on next period row",
-      abs(post_buy['carrying_value'] - exp_cv) < 1.0,
-      f"(got {post_buy['carrying_value']:,.2f}, expect {exp_cv:,.2f})")
-check("sell helper shows sold portion (negative CV, -600,000 nominal)",
-      sell['nominal_balance'] == -600_000 and sell['carrying_value'] < 0,
+check("buy row NAV/MTM populated", buy2['nav'] is not None and buy2['mtm'] is not None)
+check("sell row shows reduced position (900,000, positive carrying)",
+      sell['nominal_balance'] == 900_000 and sell['carrying_value'] > 0,
       f"(nom={sell['nominal_balance']}, cv={sell['carrying_value']})")
+# carrying continuity: buy-row carrying ≈ next period-row carrying (same date logic)
+next_period = next(r for r in rows_m if r.get('date') and r['date'] > buy2['date']
+                   and not r.get('is_buy') and not r.get('is_sell'))
+check("no jump after buy (continuity)",
+      abs(next_period['carrying_value'] - buy2['carrying_value']) < 1500,
+      f"(buy {buy2['carrying_value']:,.2f} → next {next_period['carrying_value']:,.2f})")
 
 # ── 12. Check columns tie out to ~0 everywhere ────────────────────────────────
 bad_check = [r for r in rows_m if r.get('check') not in (None, 0) and abs(r['check']) > 0.02]
@@ -254,17 +251,16 @@ check("PD implied from price discount", abs(rows_auto[0]['default_prob'] - exp_p
       f"(got {rows_auto[0]['default_prob']:.8f}, expect {exp_pd:.8f})")
 check("implied PD: premium bond → 0",
       build_cashflow_table(dict(base, clean_price=102.0))[0]['default_prob'] == 0.0)
-# EL drops when position is sold. The reduction shows on the first period row
-# AFTER the sell (the sell helper row itself carries no EL, like the reference).
+# EL drops when half the position is sold — shown on the sell row itself
+# (recognised on its date): EL halves and the Change is negative.
 rows_cs = build_cashflow_table(dict(credit, transactions=[
     {'date': date(2025,6,1), 'type': 'SELL_PARTIAL', 'nominal': 500_000.0,
      'clean_price': 98.0, 'accrued_interest': 0, 'note': ''}]))
-post_sell_c = next(r for r in rows_cs if r.get('date') and r['date'] > date(2025,6,1)
-                   and not r.get('is_buy') and not r.get('is_sell'))
-check("EL halves after selling half", abs(post_sell_c['expected_loss'] - exp_el/2) < 1.0,
-      f"(got {post_sell_c['expected_loss']:,.2f})")
-check("EL Change negative after sell", post_sell_c['el_change'] < 0,
-      f"(got {post_sell_c['el_change']})")
+sell_c = [r for r in rows_cs if r.get('is_sell')][0]
+check("EL halves after selling half", abs(sell_c['expected_loss'] - exp_el/2) < 1.0,
+      f"(got {sell_c['expected_loss']:,.2f})")
+check("EL Change negative on sell", sell_c['el_change'] < 0,
+      f"(got {sell_c['el_change']})")
 
 # ── 15. Export carries new columns + PD/LGD round-trip ────────────────────────
 xls_c = export_to_excel(credit, rows_c)
@@ -317,12 +313,10 @@ rows_fk = build_cashflow_table(fk)
 s_fk = get_summary(fk, rows_fk)
 buy2_fk = [r for r in rows_fk if r.get('is_buy') and not r.get('is_header')]
 check("fake.xlsx schedule has buy #2 row", len(buy2_fk) == 1)
-# Combined position appears on the first period row after buy #2 (15-May-26 settle)
-post_buy_fk = next(r for r in rows_fk if r.get('date') and r['date'] > date(2026,5,27)
-                   and not r.get('is_buy') and not r.get('is_sell'))
+# The buy #2 row (recognised on its date) shows the combined position directly.
 check("fake.xlsx combined nominal = 142,900,000",
-      post_buy_fk['nominal_balance'] == 142_900_000,
-      f"(got {post_buy_fk['nominal_balance']:,.0f})")
+      buy2_fk[0]['nominal_balance'] == 142_900_000,
+      f"(got {buy2_fk[0]['nominal_balance']:,.0f})")
 check("fake.xlsx initial discount = -187,304.69",
       abs(rows_fk[0]['bond_discount'] - (-187_304.69)) < 0.01,
       f"(got {rows_fk[0]['bond_discount']:,.2f})")
@@ -336,42 +330,52 @@ check("fake.xlsx coupon after buy2 = 2,858,000",
 check("fake.xlsx PD implied, LGD 0.6",
       rows_fk[0]['lgd'] == 0.6 and 0.0005 < rows_fk[0]['default_prob'] < 0.001,
       f"(PD={rows_fk[0]['default_prob']:.8f} vs sheet 0.000682)")
-# EL is flat except: first credit row (full initial EL), the row after buy2
+# EL is flat except: first credit row (full initial EL), the buy #2 row
 # (position steps up), and maturity (redeemed → drops to zero).
 el_rows_fk = [r for r in rows_fk if r.get('el_change') is not None]
-check("fake.xlsx EL flat except after-buy2 (interior rows)",
-      all(r['el_change'] == 0 for r in el_rows_fk[1:-1] if r is not post_buy_fk),
-      f"(unexpected: {[r.get('date') for r in el_rows_fk[1:-1] if r is not post_buy_fk and r['el_change'] != 0]})")
-check("fake.xlsx EL steps up after buy2", post_buy_fk['el_change'] > 0,
-      f"(got {post_buy_fk['el_change']})")
+check("fake.xlsx EL flat except the buy #2 row (interior)",
+      all(r['el_change'] == 0 for r in el_rows_fk[1:-1] if r is not buy2_fk[0]),
+      f"(unexpected: {[r.get('date') for r in el_rows_fk[1:-1] if r is not buy2_fk[0] and r['el_change'] != 0]})")
+check("fake.xlsx EL steps up on buy #2", buy2_fk[0]['el_change'] > 0,
+      f"(got {buy2_fk[0]['el_change']})")
 check("fake.xlsx EL drops to zero at maturity", el_rows_fk[-1]['expected_loss'] == 0,
       f"(got {el_rows_fk[-1]['expected_loss']})")
 
-# ── 17. Reference parity: reproduce For Python_final.xlsx (B+S+B+S) exactly,
-#        except the two documented quirks in that hand-built sheet:
-#          • 2028-04-30 (Buy 3) is recognised on its settle row, while Buy 2 and
-#            both Sells defer their effect to the next row (sheet inconsistency)
-#          • 2026-05-31 accrued uses the post-buy coupon 2,858,000 (sheet typo)
+# ── 17. Premium-bond sign check (self-contained): cumulative premium
+#        amortization is NEGATIVE, and OCI = MTM − cum_amort_disc − cum_amort_prem
+#        nets to MTM + premium_amortized. Discount bonds never exposed this. ─────
+prem_bond = dict(isin='PREM1', par_value=1_000_000.0, clean_price=105.0, coupon_rate=8.0,
+                 interest_frequency=2, settle_date=date(2024,1,15), last_interest_date=date(2023,7,15),
+                 next_interest_date=date(2024,7,15), maturity_date=date(2029,1,15),
+                 market_prices=[{'date': date(2024,1,15), 'price': 105.0}])  # flat at cost → MTM≈0
+pr = [r for r in build_cashflow_table(prem_bond) if r.get('date') == date(2026,1,15)][0]
+check("premium bond: bond_premium remaining > 0", pr['bond_premium'] > 0, f"(got {pr['bond_premium']:.2f})")
+check("premium bond: cum_amort_prem is NEGATIVE", pr['cum_amort_prem'] < 0, f"(got {pr['cum_amort_prem']:.2f})")
+# With market = cost, MTM = 0, so OCI must equal the premium amortized so far (positive)
+prem_amortized = -pr['cum_amort_prem']
+check("premium bond: OCI = MTM + premium amortized (sign correct)",
+      abs(pr['oci_gl'] - (pr['mtm'] + prem_amortized)) < 0.01,
+      f"(oci {pr['oci_gl']:.2f} vs mtm {pr['mtm']:.2f} + amort {prem_amortized:.2f})")
+check("premium bond: OCI not negated (would be wrong sign)", pr['oci_gl'] > 0,
+      f"(got {pr['oci_gl']:.2f})")
+
+# ── 18. Calculator-page parity (clean automated reference 'exel caalculator',
+#        a premium bond): the engine must reproduce EVERY valuation column exactly.
+#        (The older B+S+B+S sheet is not asserted here: it mixes deferred and
+#        immediate transaction recognition, whereas the engine recognises every
+#        transaction on its own date — see test 11.)
 import os as _os
-if _os.path.exists('For Python_final.xlsx'):
-    import verify_ref as vr
-    _ref, _prices = vr.read_reference()
-    _eng = {r['date']: r for r in build_cashflow_table(vr.build_params(_prices)) if r.get('date')}
-    # Buy 3 (2028-04-30) is recognised a row early in the sheet, so every
-    # nominal-dependent column differs there, and EL change cascades to 2028-05-31.
-    KNOWN = ({(date(2028, 4, 30), c) for c in ('E', 'I', 'K', 'M', 'N', 'O', 'X', 'Y')}
-             | {(date(2028, 5, 31), 'Y')} | {(date(2026, 5, 31), 'J')})
-    mism = set()
-    for c, fld, tol in vr.COLS:
-        for d in set(_ref) & set(_eng):
-            rv = vr.num(_ref[d].get(c))
-            if rv is None:
-                continue
-            ev = vr.num(_eng[d].get(fld))
-            if ev is None or abs(ev - rv) > tol:
-                mism.add((d, c))
-    check("reference parity: only the 2 known sheet quirks differ", mism == KNOWN,
-          f"(unexpected={sorted(mism - KNOWN)}, missing={sorted(KNOWN - mism)})")
+if _os.path.exists('~$For Python_final.xlsx'):
+    print("SKIP  file parity — For Python_final.xlsx is open in Excel (close it for a clean check)")
+elif _os.path.exists('For Python_final.xlsx'):
+    import verify_calc as vc
+    _cref, _cpr = vc.read_reference()
+    _ceng = {r['date']: r for r in build_cashflow_table(vc.build_params(_cpr)) if r.get('date')}
+    _cmis = {(d, c) for c, fld, tol in vc.COLS for d in set(_cref) & set(_ceng)
+             if vc.num(_cref[d].get(c)) is not None
+             and (_ceng[d].get(fld) is None or abs(_ceng[d][fld] - vc.num(_cref[d].get(c))) > tol)}
+    check("calculator-page parity: engine matches 'exel caalculator' exactly", not _cmis,
+          f"({sorted(_cmis)[:6]})")
 
 print()
 if FAILS:
