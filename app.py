@@ -334,11 +334,13 @@ elif page == 'calculator':
         with c3: last_int_date = st.date_input("Last Interest Date *", value=dt_date(2023,7,15))
         with c4: next_int_date = st.date_input("Next Interest Date *", value=dt_date(2024,7,15))
 
-        c1,c2,c3 = st.columns([2,2,4])
-        with c1: pd_in  = st.number_input("Default Probability (DRSK)", value=0.0, step=0.0001, format="%.6f",
-                                          help="0 = auto-derive from the price discount. Enter your DRSK value (e.g. 0.000682) to match the sheet.")
-        with c2: lgd_in = st.number_input("LGD (1 − recovery)", value=0.60, step=0.05, format="%.2f",
-                                          help="Loss given default. 0.60 = 40% recovery. Drives Expected Loss = nominal × PD × LGD.")
+        # Credit inputs are CALCULATED, not entered:
+        #   LGD = 0.60 (standard 1 − 40% recovery); PD = bond-implied from the price discount.
+        _yrs = max((maturity_date - settle_date).days / 365.25, 1e-9)
+        _pd  = max(0.0, (1 - float(clean_price) / 100) / (0.60 * _yrs))
+        st.caption(f"🧮 Credit (auto-calculated — no input needed): **LGD = 0.60** (1 − 40% recovery)  ·  "
+                   f"**Default Probability ≈ {_pd:.6f}** (bond-implied from price & years to maturity)  ·  "
+                   f"Expected Loss = nominal × PD × LGD")
 
         notes = st.text_area("Notes (optional)", height=50)
         save_base = st.form_submit_button("✅ Save Bond Terms", use_container_width=True, type="primary")
@@ -358,7 +360,8 @@ elif page == 'calculator':
                 settle_date=settle_date, last_interest_date=last_int_date,
                 next_interest_date=next_int_date, maturity_date=maturity_date,
                 discount=disc, premium=prem, coupon_dates=[],
-                default_probability=(float(pd_in) or None), lgd=float(lgd_in),
+                # PD and LGD are auto-calculated by the engine (PD = bond-implied
+                # from the price discount; LGD = 0.60). Not entered by hand.
             )
             st.session_state._notes = notes
             st.session_state.calc_txs = []
