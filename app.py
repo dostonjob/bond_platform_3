@@ -97,7 +97,7 @@ from engine.excel_io import read_from_excel, export_to_excel
 
 # ── Session state ──────────────────────────────────────────────────────────────
 for k, v in [('page','home'),('params',None),('rows',None),('summary',None),
-              ('edit_id',None),('calc_txs',[]),('warnings',[]),
+              ('edit_id',None),('calc_txs',[]),('calc_mkt',[]),('warnings',[]),
               ('xls_for',None),('xls_data',None)]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -133,12 +133,16 @@ def tx_pill(tx, num):
     else:
         cls, icon = 'tx-sell-partial', '🟡'
     note_part = f' &nbsp;|&nbsp; {tx.get("note","")}' if tx.get('note') else ''
+    if 'SELL' in tp:
+        price_part = 'at book value'
+    else:
+        price_part = (f'Price: {tx.get("clean_price",0):.6f}% &nbsp;|&nbsp; '
+                      f'Accrued: {tx.get("accrued_interest",0):,.2f}')
     return (f'<div class="{cls}">'
             f'{icon} <b>#{num} {tp}</b> &nbsp;|&nbsp; '
             f'📅 {fmt_date(tx.get("date"))} &nbsp;|&nbsp; '
             f'Nominal: <b>{tx.get("nominal",0):,.0f}</b> &nbsp;|&nbsp; '
-            f'Price: {tx.get("clean_price",0):.6f}% &nbsp;|&nbsp; '
-            f'Accrued: {tx.get("accrued_interest",0):,.2f}'
+            f'{price_part}'
             f'{note_part}</div>')
 
 def run_calc(params):
@@ -330,6 +334,12 @@ elif page == 'calculator':
         with c3: last_int_date = st.date_input("Last Interest Date *", value=dt_date(2023,7,15))
         with c4: next_int_date = st.date_input("Next Interest Date *", value=dt_date(2024,7,15))
 
+        c1,c2,c3 = st.columns([2,2,4])
+        with c1: pd_in  = st.number_input("Default Probability (DRSK)", value=0.0, step=0.0001, format="%.6f",
+                                          help="0 = auto-derive from the price discount. Enter your DRSK value (e.g. 0.000682) to match the sheet.")
+        with c2: lgd_in = st.number_input("LGD (1 − recovery)", value=0.60, step=0.05, format="%.2f",
+                                          help="Loss given default. 0.60 = 40% recovery. Drives Expected Loss = nominal × PD × LGD.")
+
         notes = st.text_area("Notes (optional)", height=50)
         save_base = st.form_submit_button("✅ Save Bond Terms", use_container_width=True, type="primary")
 
@@ -348,9 +358,11 @@ elif page == 'calculator':
                 settle_date=settle_date, last_interest_date=last_int_date,
                 next_interest_date=next_int_date, maturity_date=maturity_date,
                 discount=disc, premium=prem, coupon_dates=[],
+                default_probability=(float(pd_in) or None), lgd=float(lgd_in),
             )
             st.session_state._notes = notes
             st.session_state.calc_txs = []
+            st.session_state.calc_mkt = []
             st.rerun()
 
     # Show bond type hint live
@@ -394,26 +406,63 @@ elif page == 'calculator':
 
         # Add transaction form
         st.markdown("##### ➕ Add Transaction")
+        # Type lives outside the form so the fields can adapt to buy vs sell.
+        tx_type = st.selectbox("Type", ["BUY", "SELL_PARTIAL", "SELL_FULL"], key="calc_tx_type")
+        is_sell = 'SELL' in tx_type
         with st.form("add_tx", clear_on_submit=True):
-            c1,c2,c3,c4,c5 = st.columns([2,2,2,2,3])
-            with c1: tx_date  = st.date_input("Date",         value=dt_date(2024,7,15))
-            with c2: tx_type  = st.selectbox("Type",          ["BUY","SELL_PARTIAL","SELL_FULL"])
-            with c3: tx_nom   = st.number_input("Nominal",    value=1_000_000.0, step=100_000.0, format="%.2f")
-            with c4: tx_price = st.number_input("Clean Price (%)", value=float(bp.get('clean_price',95)), step=0.0001, format="%.6f")
-            with c5: tx_note  = st.text_input("Note",         placeholder="e.g. Buy #2 — secondary market")
-            c1, c2 = st.columns([2,5])
-            with c1: tx_acc = st.number_input("Accrued Interest (0 = auto-calculate)", value=0.0, format="%.4f")
+            if is_sell:
+                c1, c2, c3 = st.columns([2, 2, 5])
+                with c1: tx_date = st.date_input("Date", value=dt_date(2024, 7, 15))
+                with c2: tx_nom  = st.number_input("Nominal to sell", value=1_000_000.0, step=100_000.0,
+                                                   format="%.2f", help="Ignored for SELL_FULL (sells the whole holding).")
+                with c3: tx_note = st.text_input("Note", placeholder="e.g. Sell #1")
+                tx_price = tx_acc = None   # book sale — no price/accrued, like your Excel
+                st.caption("Sells are booked at carrying value (like your Excel) — no clean price or accrued interest needed.")
+            else:
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
+                with c1: tx_date  = st.date_input("Date", value=dt_date(2024, 7, 15))
+                with c2: tx_nom   = st.number_input("Nominal", value=1_000_000.0, step=100_000.0, format="%.2f")
+                with c3: tx_price = st.number_input("Clean Price (%)", value=float(bp.get('clean_price', 95)), step=0.0001, format="%.6f")
+                with c4: tx_note  = st.text_input("Note", placeholder="e.g. Buy #2 — secondary market")
+                c1, _ = st.columns([2, 5])
+                with c1: tx_acc = st.number_input("Accrued Interest (0 = auto-calculate)", value=0.0, format="%.4f")
             add_tx = st.form_submit_button("➕ Add", type="primary", use_container_width=True)
 
         if add_tx:
-            st.session_state.calc_txs.append({
-                'date':             tx_date,
-                'type':             tx_type,
-                'nominal':          float(tx_nom),
-                'clean_price':      float(tx_price),
-                'accrued_interest': float(tx_acc),
-                'note':             tx_note,
-            })
+            tx = {'date': tx_date, 'type': tx_type, 'nominal': float(tx_nom), 'note': tx_note}
+            if not is_sell:                       # sells carry no price/accrued (book value)
+                tx['clean_price']      = float(tx_price)
+                tx['accrued_interest'] = float(tx_acc)
+            st.session_state.calc_txs.append(tx)
+            st.rerun()
+
+        # ── Step 3: Market Prices (optional) ──────────────────────────────────
+        st.markdown("---")
+        sec("Step 3 — Market Prices (optional · drives MTM / OCI / NAV)")
+        st.caption("Each quote is the clean market price on a date and holds until the next "
+                   "quote. Before the first quote the bond marks at its purchase price; at "
+                   "maturity it redeems at par (100). Leave empty to report at amortized cost (MTM = 0).")
+        for i, q in enumerate(st.session_state.calc_mkt):
+            cq, cd = st.columns([10, 1])
+            with cq:
+                st.markdown(f'<div class="tx-buy">📈 <b>{fmt_date(q["date"])}</b> &nbsp;|&nbsp; '
+                            f'Market price: <b>{q["price"]:.6f}%</b></div>', unsafe_allow_html=True)
+            with cd:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("✕", key=f"delq_{i}", help="Remove this quote"):
+                    st.session_state.calc_mkt.pop(i)
+                    st.rerun()
+        with st.form("add_mkt", clear_on_submit=True):
+            cq1, cq2, cq3 = st.columns([2, 2, 3])
+            with cq1: mq_date  = st.date_input("Quote date", value=bp['settle_date'], key="mq_date")
+            with cq2: mq_price = st.number_input("Market price (%)", value=float(bp.get('clean_price', 100)),
+                                                 step=0.0001, format="%.6f", key="mq_price")
+            with cq3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                add_mq = st.form_submit_button("📈 Add Quote", use_container_width=True)
+        if add_mq:
+            st.session_state.calc_mkt.append({'date': mq_date, 'price': float(mq_price)})
+            st.session_state.calc_mkt.sort(key=lambda q: q['date'])
             st.rerun()
 
         # Summary before calculate
@@ -433,7 +482,8 @@ elif page == 'calculator':
         st.markdown("")
 
         if st.button("▶ Calculate Full Schedule", type="primary", use_container_width=True):
-            params = {**bp, 'transactions': st.session_state.calc_txs}
+            params = {**bp, 'transactions': st.session_state.calc_txs,
+                      'market_prices': st.session_state.calc_mkt}
             with st.spinner("Building multi-transaction schedule..."):
                 rows, summary = run_calc(params)
             rid = save_bond(params, st.session_state.calc_txs,
@@ -579,24 +629,65 @@ elif page == 'edit_bond':
 
     st.markdown("---")
     sec("Add New Transaction")
+    nt_type = st.selectbox("Type", ["BUY", "SELL_PARTIAL", "SELL_FULL"], key="edit_tx_type")
+    nt_is_sell = 'SELL' in nt_type
     with st.form("edit_tx", clear_on_submit=True):
-        c1,c2,c3,c4,c5 = st.columns([2,2,2,2,3])
-        with c1: nt_date  = st.date_input("Date",        value=dt_date(2024,7,15))
-        with c2: nt_type  = st.selectbox("Type",         ["BUY","SELL_PARTIAL","SELL_FULL"])
-        with c3: nt_nom   = st.number_input("Nominal",   value=1_000_000.0, step=100_000.0, format="%.2f")
-        with c4: nt_price = st.number_input("Clean Price (%)", value=float(p.get('clean_price',95)), step=0.0001, format="%.6f")
-        with c5: nt_note  = st.text_input("Note",        placeholder="e.g. Buy #3 — tap")
-        c1,_ = st.columns([2,5])
-        with c1: nt_acc = st.number_input("Accrued Interest (0 = auto-calculate)", value=0.0, format="%.4f")
+        if nt_is_sell:
+            c1, c2, c3 = st.columns([2, 2, 5])
+            with c1: nt_date = st.date_input("Date", value=dt_date(2024, 7, 15))
+            with c2: nt_nom  = st.number_input("Nominal to sell", value=1_000_000.0, step=100_000.0,
+                                               format="%.2f", help="Ignored for SELL_FULL (sells the whole holding).")
+            with c3: nt_note = st.text_input("Note", placeholder="e.g. Sell #1")
+            nt_price = nt_acc = None
+            st.caption("Sells are booked at carrying value (like your Excel) — no clean price or accrued interest needed.")
+        else:
+            c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
+            with c1: nt_date  = st.date_input("Date", value=dt_date(2024, 7, 15))
+            with c2: nt_nom   = st.number_input("Nominal", value=1_000_000.0, step=100_000.0, format="%.2f")
+            with c3: nt_price = st.number_input("Clean Price (%)", value=float(p.get('clean_price', 95)), step=0.0001, format="%.6f")
+            with c4: nt_note  = st.text_input("Note", placeholder="e.g. Buy #3 — tap")
+            c1, _ = st.columns([2, 5])
+            with c1: nt_acc = st.number_input("Accrued Interest (0 = auto-calculate)", value=0.0, format="%.4f")
         add_btn = st.form_submit_button("➕ Add Transaction", type="primary", use_container_width=True)
 
     if add_btn:
-        add_transaction(rec['id'], {
-            'date': nt_date, 'type': nt_type,
-            'nominal': float(nt_nom), 'clean_price': float(nt_price),
-            'accrued_interest': float(nt_acc), 'note': nt_note,
-        })
+        nt = {'date': nt_date, 'type': nt_type, 'nominal': float(nt_nom), 'note': nt_note}
+        if not nt_is_sell:
+            nt['clean_price']      = float(nt_price)
+            nt['accrued_interest'] = float(nt_acc)
+        add_transaction(rec['id'], nt)
         st.success(f"Added {nt_type} {float(nt_nom):,.0f} on {nt_date}")
+        st.rerun()
+
+    # ── Market prices (optional) ────────────────────────────────────────────
+    st.markdown("---")
+    sec("Market Prices (optional · drives MTM / OCI / NAV)")
+    st.caption("Each quote is the clean market price on a date and holds until the next. "
+               "Empty = amortized cost (MTM = 0); the bond redeems at par (100) at maturity.")
+    mkt = list(p.get('market_prices', []) or [])
+    for i, q in enumerate(mkt):
+        qd = parse_date(q.get('date'))
+        cq, cd = st.columns([10, 1])
+        with cq:
+            st.markdown(f'<div class="tx-buy">📈 <b>{fmt_date(qd)}</b> &nbsp;|&nbsp; '
+                        f'Market price: <b>{float(q.get("price", 0)):.6f}%</b></div>', unsafe_allow_html=True)
+        with cd:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("✕", key=f"edelq_{i}"):
+                update_bond(rec['id'], params={**p, 'market_prices': [x for j, x in enumerate(mkt) if j != i]})
+                st.rerun()
+    with st.form("edit_mkt", clear_on_submit=True):
+        cq1, cq2, cq3 = st.columns([2, 2, 3])
+        with cq1: eq_date  = st.date_input("Quote date", value=parse_date(p.get('settle_date')) or dt_date(2024, 1, 15), key="eq_date")
+        with cq2: eq_price = st.number_input("Market price (%)", value=float(p.get('clean_price', 100)), step=0.0001, format="%.6f", key="eq_price")
+        with cq3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            add_mq2 = st.form_submit_button("📈 Add Quote", use_container_width=True)
+    if add_mq2:
+        new_mkt = mkt + [{'date': eq_date, 'price': float(eq_price)}]
+        new_mkt.sort(key=lambda q: parse_date(q['date']) or eq_date)
+        update_bond(rec['id'], params={**p, 'market_prices': new_mkt})
+        st.success(f"Added market quote {float(eq_price):.6f}% on {eq_date}")
         st.rerun()
 
     st.markdown("---")
@@ -637,6 +728,10 @@ elif page == 'results':
     # ── Validation warnings ───────────────────────────────────────────────────
     for w in (st.session_state.warnings or []):
         st.warning(f"⚠️ {w}")
+
+    if not params.get('market_prices'):
+        st.info("📈 No market prices entered, so **MTM**, **OCI G/L** and **NAV** are shown at amortized cost "
+                "(MTM = 0). Add market quotes in **New Bond → Step 3** or **Edit Bond → Market Prices** to populate them.")
 
     # ── Key metrics ───────────────────────────────────────────────────────────
     sec("Key Metrics")

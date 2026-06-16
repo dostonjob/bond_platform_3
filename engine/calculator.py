@@ -368,6 +368,47 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     disc0, prem0 = calc_discount_premium(par_value, initial_price)
 
+    # ── Market-price series (drives Price / MTM / OCI / NAV) ─────────────────
+    # Quotes are (date, clean_price). Each quote holds until the next one
+    # (step function). Before the first quote the bond marks at its purchase
+    # price. When no quotes are supplied the engine falls back to amortised-cost
+    # behaviour (MTM = 0, price = WAC) — see the period-row block below.
+    raw_mp = params.get('market_prices') or []
+    if isinstance(raw_mp, dict):
+        raw_mp = [{'date': k, 'price': v} for k, v in raw_mp.items()]
+    mkt_quotes = []
+    for q in raw_mp:
+        if isinstance(q, dict):
+            qd, qp = parse_date(q.get('date')), safe_float(q.get('price'))
+        elif isinstance(q, (list, tuple)) and len(q) >= 2:
+            qd, qp = parse_date(q[0]), safe_float(q[1])
+        else:
+            continue
+        if qd and qp is not None:
+            mkt_quotes.append((qd, qp))
+    mkt_quotes.sort(key=lambda x: x[0])
+    have_market = bool(mkt_quotes)
+
+    def _mkt_at(d: date) -> float:
+        """Carry-forward market price on date d (purchase price before quote 1).
+        At maturity the bond redeems at par, so it pulls to 100 unless a quote
+        explicitly says otherwise."""
+        if d == maturity_date and not any(qd == d for qd, _ in mkt_quotes):
+            return 100.0
+        price = initial_price
+        for qd, qp in mkt_quotes:
+            if qd <= d:
+                price = qp
+            else:
+                break
+        return price
+
+    def _mtm_of(current_lots: List[Dict], mkt: float) -> float:
+        """Mark-to-market = Σ lot_nominal × (market − lot_buy_price) / 100.
+        Lots are already scaled proportionally on sells, so this reproduces
+        the reference's post-sell MTM scaling automatically."""
+        return sum(l['nominal'] * (mkt - l['clean_price']) / 100.0 for l in current_lots)
+
     # Transaction lookup by date
     tx_by_date: Dict[date, List] = {}
     for t in transactions:
@@ -458,15 +499,17 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Running realized totals across the whole schedule
     cum_sell_pl  = 0.0                  # Σ realized P&L from sells
     cum_interest = -accrued_initial     # accrued paid at purchase is negative income
-    prev_el      = None                 # for the Expected Loss "Change" column
+    prev_el      = 0.0                  # for the Expected Loss "Change" column
 
-    def _credit(row: Dict, cost_basis: float):
-        """Expected Loss = invested cost × PD × LGD (as in the reference sheet);
-        Change is non-zero only when the position changes."""
+    def _credit(row: Dict, exposure: float):
+        """Expected Loss = nominal exposure × PD × LGD (as in the reference sheet:
+        X = nominal × PD × LGD). Change is the period-over-period move in EL, so
+        the first credit row shows the full initial EL and thereafter it is
+        non-zero only when the position (nominal) changes."""
         nonlocal prev_el
-        el = round((cost_basis or 0.0) * el_rate, 2)
+        el = round((exposure or 0.0) * el_rate, 2)
         row['expected_loss'] = el
-        row['el_change']     = round(el - prev_el, 2) if prev_el is not None else 0.0
+        row['el_change']     = round(el - prev_el, 2)
         prev_el = el
 
     # ── Opening row (purchase) ────────────────────────────────────────────────
@@ -474,6 +517,7 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
     carrying0   = par_value * initial_price / 100.0
     r = _blank_row()
     r.update({
+        'date':            settle_date,
         'label':           f'Buy #1 — {par_value:,.0f} @ {initial_price:.6f}%',
         'cashflow':        purchase_cf,
         'nominal_change':  par_value,
@@ -498,7 +542,8 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
         'is_buy':          True,
         'tx_detail':       f'Initial purchase: {par_value:,.0f} @ {initial_price:.6f}%  |  accrued paid: {accrued_initial:,.2f}',
     })
-    _credit(r, carrying0)
+    # Opening (settle) row carries no Expected Loss in the reference — EL starts
+    # on the first period row, where its full value appears as the first Change.
     rows.append(r)
 
     # ── Main date loop ────────────────────────────────────────────────────────
@@ -508,8 +553,14 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
         if d < settle_date:
             continue
 
-        # ── Process any transactions on this date ─────────────────────────────
+        # ── Transactions settling on this date ────────────────────────────────
+        # Reference convention: each transaction is its own (undated) helper
+        # row; the dated period row for `d` still reflects the PRE-transaction
+        # position; the change only takes effect from the next dated row. So we
+        # freeze a snapshot for d's period row, then mutate `lots` for later dates.
+        snap_lots = lots
         if d in tx_by_date:
+            snap_lots = [dict(l) for l in lots]   # pre-transaction state for d's row
             for tx in tx_by_date[d]:
                 tx_type  = tx['type']
                 tx_nom   = float(tx.get('nominal', 0) or 0)
@@ -522,6 +573,35 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
                     if not tx_acc:
                         tx_acc = _accrued_at(tx_nom, d)
                     disc_tx, prem_tx = calc_discount_premium(tx_nom, tx_price)
+                    cost  = tx_nom * tx_price / 100.0
+                    cf_tx = -(cost + tx_acc)
+                    cum_interest -= tx_acc
+
+                    # Helper row: the new lot's opening values only (the combined
+                    # position appears on the next dated row).
+                    r = _blank_row()
+                    r.update({
+                        'label':           f'Buy #{buy_counter} — {tx_nom:,.0f} @ {tx_price:.6f}%',
+                        'cashflow':        cf_tx,
+                        'nominal_change':  tx_nom,
+                        'num_days':        days_between(settle_date, d),
+                        'bond_discount':   round(disc_tx, 4),
+                        'cum_amort_disc':  0.0,
+                        'bond_premium':    round(prem_tx, 4),
+                        'cum_amort_prem':  0.0,
+                        'carrying_value':  round(cost, 4),
+                        'accrued_int':     tx_acc,
+                        'nominal_balance': tx_nom,
+                        'price':           tx_price,
+                        'realized_interest_income': round(cum_interest, 2),
+                        'total_pl':        round(cum_sell_pl + cum_interest, 2),
+                        'wac':             tx_price,
+                        'is_buy':          True,
+                        'tx_detail':       f'Buy #{buy_counter}: {tx_nom:,.0f} face @ {tx_price:.6f}%  |  accrued paid: {tx_acc:,.2f}'
+                                           + (f'  |  {tx_note}' if tx_note else ''),
+                    })
+                    rows.append(r)
+
                     lots.append({
                         'settle_date': d,
                         'nominal':     tx_nom,
@@ -529,128 +609,83 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
                         'disc':        disc_tx,
                         'prem':        prem_tx,
                     })
-                    cf_tx = -(tx_nom * tx_price / 100.0 + tx_acc)
-                    cum_interest -= tx_acc
-
-                    # Full position snapshot AFTER the buy (all lots combined)
-                    tn, td, tp_, ca, cp_, cv, wac = _agg(lots, d)
-                    mtm = tn * wac / 100.0 - cv
-                    nav = cv + mtm
-
-                    r = _blank_row()
-                    r.update({
-                        'date':            d,
-                        'label':           f'Buy #{buy_counter} — {tx_nom:,.0f} @ {tx_price:.6f}%',
-                        'cashflow':        cf_tx,
-                        'nominal_change':  tx_nom,
-                        'num_days':        days_between(settle_date, d),
-                        'bond_discount':   round(td, 4),
-                        'cum_amort_disc':  round(ca, 4),
-                        'bond_premium':    round(tp_, 4),
-                        'cum_amort_prem':  round(cp_, 4),
-                        'carrying_value':  round(cv, 4),
-                        'accrued_int':     tx_acc,
-                        'nominal_balance': tn,
-                        'price':           tx_price,
-                        'mtm':             round(mtm, 2),
-                        'oci_gl':          round(mtm, 2),
-                        'nav':             round(nav, 2),
-                        'check':           round(cv - (tn + td + tp_), 2),
-                        'check2':          round(nav - (cv + mtm), 2),
-                        'realized_interest_income': round(cum_interest, 2),
-                        'total_pl':        round(cum_sell_pl + cum_interest, 2),
-                        'wac':             round(wac, 8),
-                        'is_buy':          True,
-                        'tx_detail':       f'Buy #{buy_counter}: {tx_nom:,.0f} face @ {tx_price:.6f}%  |  accrued paid: {tx_acc:,.2f}'
-                                           + (f'  |  {tx_note}' if tx_note else ''),
-                    })
-                    _credit(r, tn * wac / 100.0)
-                    rows.append(r)
 
                 elif tx_type in ('SELL_FULL', 'SELL_PARTIAL'):
                     total_nom_before = sum(l['nominal'] for l in lots)
                     sell_nom = total_nom_before if tx_type == 'SELL_FULL' else min(tx_nom, total_nom_before)
-
                     if sell_nom <= 0:
                         continue
 
-                    if not tx_acc:
-                        tx_acc = _accrued_at(sell_nom, d)
-
-                    # Snapshot BEFORE sell — needed for WAC and proportional CV
+                    # Snapshot BEFORE sell — WAC and proportional CV of sold part
                     _, _, _, _, _, _, wac_before = _agg(lots, d)
+                    _pl_unused, cv_sold = _proportional_pl(lots, sell_nom, 0.0, d, maturity_date)
 
-                    # Proportional P&L: P&L = proceeds − proportional CV of sold portion
-                    pl, cv_sold = _proportional_pl(lots, sell_nom, tx_price, d, maturity_date)
-                    proceeds = sell_nom * tx_price / 100.0 + tx_acc
+                    # A sale price is optional. WITH a price the sale realises a
+                    # P&L (proceeds − book carrying value); WITHOUT one it is a
+                    # pure book reduction — no cashflow, no realised P&L — which is
+                    # how the reference amortised-cost sheet records sells (price
+                    # and accrued columns left blank).
+                    sell_price = safe_float(tx.get('clean_price'))
+                    if sell_price and sell_price > 0:
+                        sell_acc = float(safe_float(tx.get('accrued_interest')) or 0) or _accrued_at(sell_nom, d)
+                        proceeds = sell_nom * sell_price / 100.0 + sell_acc
+                        pl       = round(proceeds - cv_sold, 2)
+                        cum_sell_pl  += pl
+                        cum_interest += sell_acc
+                        cf, rpl, pr, acc = proceeds, pl, sell_price, sell_acc
+                        detail = (f'Sell {sell_nom:,.0f} face @ {sell_price:.6f}%  |  proceeds: {proceeds:,.2f}'
+                                  f'  |  CV removed: {cv_sold:,.2f}  |  realized P&L: {pl:+,.2f}')
+                    else:
+                        cf, rpl, pr, acc = None, None, None, 0.0
+                        detail = f'Sell {sell_nom:,.0f} face at book value  |  CV removed: {cv_sold:,.2f}'
 
-                    # Scale all lots proportionally (the Excel method)
-                    lots = _proportional_unwind(lots, sell_nom)
-                    cum_sell_pl  += pl
-                    cum_interest += tx_acc
-
-                    # Post-sell remaining position
-                    tn, td, tp_, ca, cp_, cv, wac = _agg(lots, d)
-
-                    # MTM on sell row = unrealised difference between sell price and cost
-                    mtm_sell = round(sell_nom * (tx_price - (wac_before or tx_price)) / 100.0, 2)
-
+                    # Helper row: the sold portion only (carrying value removed is
+                    # shown negative; the reduced position appears on the next row).
                     r = _blank_row()
                     r.update({
-                        'date':            d,
-                        'label':           f'{"Full Sell" if tx_type=="SELL_FULL" else "Partial Sell"} — {sell_nom:,.0f} @ {tx_price:.6f}%',
-                        'cashflow':        proceeds,
+                        'label':           f'{"Full Sell" if tx_type=="SELL_FULL" else "Partial Sell"} — {sell_nom:,.0f}',
+                        'cashflow':        cf,
                         'nominal_change':  -sell_nom,
                         'num_days':        days_between(settle_date, d),
-                        'bond_discount':   round(td, 4),
-                        'cum_amort_disc':  round(ca, 4),
-                        'bond_premium':    round(tp_, 4),
-                        'cum_amort_prem':  round(cp_, 4),
-                        # cv_sold stored separately for Excel; carrying_value = remaining
                         'cv_sold':         round(cv_sold, 4),
-                        'carrying_value':  round(cv, 4),
-                        'accrued_int':     tx_acc,
-                        'nominal_balance': tn,
-                        'price':           tx_price,
-                        'mtm':             mtm_sell,
-                        'oci_gl':          mtm_sell,
-                        'nav':             round(cv + mtm_sell, 2),
-                        'check':           round(cv - (tn + td + tp_), 2),
-                        'check2':          0.0,
-                        'realized_pl':     pl,
+                        'carrying_value':  round(-cv_sold, 4),
+                        'accrued_int':     acc,
+                        'nominal_balance': -sell_nom,
+                        'price':           pr,
+                        'realized_pl':     rpl,
                         'realized_interest_income': round(cum_interest, 2),
                         'total_pl':        round(cum_sell_pl + cum_interest, 2),
                         'wac':             round(wac_before, 8) if wac_before is not None else None,
                         'is_sell':         True,
-                        'tx_detail':       f'Sell {sell_nom:,.0f} face @ {tx_price:.6f}%'
-                                           f'  |  proceeds: {proceeds:,.2f}'
-                                           f'  |  CV removed: {cv_sold:,.2f}'
-                                           f'  |  realized P&L: {pl:+,.2f}'
-                                           + (f'  |  {tx_note}' if tx_note else ''),
+                        'tx_detail':       detail + (f'  |  {tx_note}' if tx_note else ''),
                     })
-                    _credit(r, tn * wac / 100.0 if wac is not None else 0.0)
                     rows.append(r)
+
+                    lots = _proportional_unwind(lots, sell_nom)
 
         # Skip settle date period row (already in opening row)
         if d == settle_date:
             continue
 
-        # Skip if fully sold out
-        total_nominal = sum(l['nominal'] for l in lots)
-        if total_nominal <= 0:
+        # Skip if fully sold out (the period row reflects the PRE-transaction
+        # snapshot, so a sell on `d` still shows the position on `d` itself).
+        if sum(l['nominal'] for l in snap_lots) <= 0:
             if d == maturity_date:
                 break
             continue
 
-        # ── Period snapshot ───────────────────────────────────────────────────
+        # ── Period snapshot (pre-transaction position on `d`) ──────────────────
         num_days = days_between(settle_date, d)
 
-        # Aggregate amortized disc/prem across all lots
-        total_nominal, total_disc, total_prem, cum_adisc, cum_aprem, carrying_val, wac = _agg(lots, d)
+        # Aggregate amortized disc/prem across the snapshot lots
+        total_nominal, total_disc, total_prem, cum_adisc, cum_aprem, carrying_val, wac = _agg(snap_lots, d)
 
-        # Accrued interest on current nominal balance
+        # Accrued interest steps to the coupon of the position held GOING FORWARD
+        # from `d` (i.e. after any transaction settling on `d`) — matches the
+        # reference's "new coupon to be accrued", which changes on the trade date.
+        fwd_nominal = sum(l['nominal'] for l in lots)
         cpp = total_nominal * coupon_rate / 100.0 / freq
-        accrued_row = _accrued_at(total_nominal, d)
+        accrued_row = _accrued_at(fwd_nominal, d)
 
         is_coupon   = d in cpn_set
         is_maturity = d == maturity_date
@@ -665,12 +700,19 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
             accrued_row   = cpp
             cum_interest += cpp
 
-        # No market price available on period rows → MTM = 0.
-        # OCI = 0 (no unrealised price movement without a market quote).
-        # NAV = carrying value (amortised cost).
-        mtm    = 0.0
-        oci_gl = 0.0
-        nav    = carrying_val
+        # Market mark-to-market when a price series is supplied; otherwise fall
+        # back to amortised cost (MTM = 0, price = WAC).
+        if have_market:
+            mkt       = _mkt_at(d)
+            row_price = mkt
+            mtm       = _mtm_of(snap_lots, mkt)
+            oci_gl    = mtm - cum_adisc - cum_aprem
+            nav       = total_nominal * mkt / 100.0
+        else:
+            row_price = wac
+            mtm       = 0.0
+            oci_gl    = 0.0
+            nav       = carrying_val
 
         r = _blank_row()
         r.update({
@@ -684,7 +726,7 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
             'carrying_value':  round(carrying_val, 4),
             'accrued_int':     round(accrued_row, 4),
             'nominal_balance': total_nominal,
-            'price':           round(wac, 8),
+            'price':           round(row_price, 8),
             'mtm':             round(mtm, 2),
             'oci_gl':          round(oci_gl, 2),
             'nav':             round(nav, 2),
@@ -697,7 +739,9 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
             'is_coupon':       is_coupon,
             'is_maturity':     is_maturity,
         })
-        _credit(r, total_nominal * wac / 100.0)
+        # EL is on nominal exposure (reference: X = nominal × PD × LGD); at
+        # maturity the bond redeems, so credit exposure (and EL) drops to zero.
+        _credit(r, 0.0 if is_maturity else total_nominal)
 
         if is_maturity:
             # Redemption at par: principal + final coupon (or stub accrued)
@@ -707,9 +751,10 @@ def build_cashflow_table(params: Dict[str, Any]) -> List[Dict[str, Any]]:
             r['nominal_change'] = -total_nominal
             r['accrued_int']    = round(final_int, 4)
             r['interest_paid']  = final_int
-            r['mtm']            = 0.0
-            r['oci_gl']         = 0.0
-            r['nav']            = round(carrying_val, 4)
+            if not have_market:           # market rows already pull to par at maturity
+                r['mtm']    = 0.0
+                r['oci_gl'] = 0.0
+                r['nav']    = round(carrying_val, 4)
             r['realized_interest_income'] = round(cum_interest, 2)
             r['total_pl']       = round(cum_sell_pl + cum_interest, 2)
             r['label']          = ('Maturity — Principal + Final Coupon'
@@ -771,12 +816,13 @@ def get_summary(params: Dict, rows: List[Dict]) -> Dict:
             expected_loss            = r.get('expected_loss')
             break
 
-    # Current holding = last known nominal balance in the schedule
-    current_nominal = 0.0
-    for r in reversed(rows):
-        if r.get('nominal_balance') is not None:
-            current_nominal = r['nominal_balance']
-            break
+    # Current holding = net of every buy/sell nominal delta. Derived from the
+    # transaction rows (not the last period row), since with the deferred-effect
+    # convention a full sell leaves no later period row to read the balance from.
+    current_nominal = sum(r['nominal_change'] for r in rows
+                          if (r.get('is_buy') or r.get('is_sell'))
+                          and not r.get('is_maturity')
+                          and r.get('nominal_change') is not None)
     matured = any(r.get('is_maturity') for r in rows)
     if matured:
         status, current_nominal = 'Matured', 0.0
